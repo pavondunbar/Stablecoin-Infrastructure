@@ -688,4 +688,4 @@ This project is provided as-is for educational and reference purposes under the 
 
 ---
 
-*Built by Pavon Dunbar — Modeled on JPMorgan Kinexys (JPM Coin), PayPal PYUSD, and the Regulated Liability Network (RLN)*
+*Built with ❤️ by Pavon Dunbar — Modeled on JPMorgan Kinexys (JPM Coin), PayPal PYUSD, and the Regulated Liability Network (RLN)*
