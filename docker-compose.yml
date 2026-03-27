@@ -1,0 +1,279 @@
+version: "3.9"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Trust Boundary Model:
+#   DMZ network  → only api-gateway is reachable from outside
+#   internal net → postgres, kafka, and all microservices
+#   Each service container can only reach what it needs.
+# ─────────────────────────────────────────────────────────────────────────────
+
+networks:
+  dmz:
+    driver: bridge
+  internal:
+    driver: bridge
+    internal: true          # no outbound internet access from internal net
+
+volumes:
+  postgres_data:
+  kafka_data:
+  zookeeper_data:
+
+services:
+
+  # ── Infrastructure ────────────────────────────────────────────────────────
+
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-stablecoin}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-s3cr3t}
+      POSTGRES_DB: ${POSTGRES_DB:-stablecoin_db}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init/postgres:/docker-entrypoint-initdb.d:ro
+    networks:
+      - internal
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-stablecoin}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.6.0
+    restart: unless-stopped
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    volumes:
+      - zookeeper_data:/var/lib/zookeeper
+    networks:
+      - internal
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "2181"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  kafka:
+    image: confluentinc/cp-kafka:7.6.0
+    restart: unless-stopped
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:9092
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_LOG_RETENTION_HOURS: 168
+    volumes:
+      - kafka_data:/var/lib/kafka
+    networks:
+      - internal
+    healthcheck:
+      test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:9092"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+
+  kafka-init:
+    image: confluentinc/cp-kafka:7.6.0
+    depends_on:
+      kafka:
+        condition: service_healthy
+    volumes:
+      - ./init/kafka:/scripts:ro
+    networks:
+      - internal
+    entrypoint: ["/bin/bash", "/scripts/create_topics.sh"]
+    restart: "no"
+
+  # ── Microservices ─────────────────────────────────────────────────────────
+
+  token-issuance:
+    build:
+      context: .
+      dockerfile: services/token-issuance/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+    environment:
+      SERVICE_NAME: token-issuance
+      DATABASE_URL: postgresql+psycopg2://${POSTGRES_USER:-stablecoin}:${POSTGRES_PASSWORD:-s3cr3t}@postgres:5432/${POSTGRES_DB:-stablecoin_db}
+      KAFKA_BOOTSTRAP: kafka:9092
+      PORT: 8001
+    networks:
+      - internal
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  rtgs:
+    build:
+      context: .
+      dockerfile: services/rtgs/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+    environment:
+      SERVICE_NAME: rtgs
+      DATABASE_URL: postgresql+psycopg2://${POSTGRES_USER:-stablecoin}:${POSTGRES_PASSWORD:-s3cr3t}@postgres:5432/${POSTGRES_DB:-stablecoin_db}
+      KAFKA_BOOTSTRAP: kafka:9092
+      PORT: 8002
+    networks:
+      - internal
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8002/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  payment-engine:
+    build:
+      context: .
+      dockerfile: services/payment-engine/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+    environment:
+      SERVICE_NAME: payment-engine
+      DATABASE_URL: postgresql+psycopg2://${POSTGRES_USER:-stablecoin}:${POSTGRES_PASSWORD:-s3cr3t}@postgres:5432/${POSTGRES_DB:-stablecoin_db}
+      KAFKA_BOOTSTRAP: kafka:9092
+      PORT: 8003
+    networks:
+      - internal
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8003/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  fx-settlement:
+    build:
+      context: .
+      dockerfile: services/fx-settlement/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+    environment:
+      SERVICE_NAME: fx-settlement
+      DATABASE_URL: postgresql+psycopg2://${POSTGRES_USER:-stablecoin}:${POSTGRES_PASSWORD:-s3cr3t}@postgres:5432/${POSTGRES_DB:-stablecoin_db}
+      KAFKA_BOOTSTRAP: kafka:9092
+      PORT: 8004
+    networks:
+      - internal
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8004/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  # ── Compliance Monitor ────────────────────────────────────────────────────
+
+  compliance-monitor:
+    build:
+      context: .
+      dockerfile: services/compliance-monitor/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+    environment:
+      SERVICE_NAME: compliance-monitor
+      DATABASE_URL: postgresql+psycopg2://${POSTGRES_USER:-stablecoin}:${POSTGRES_PASSWORD:-s3cr3t}@postgres:5432/${POSTGRES_DB:-stablecoin_db}
+      KAFKA_BOOTSTRAP: kafka:9092
+      PORT: 8005
+    networks:
+      - internal
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8005/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  # ── API Gateway — only internet-facing service ─────────────────────────────
+
+  # ── Observability Stack ───────────────────────────────────────────────────
+
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    restart: unless-stopped
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.retention.time=7d"
+      - "--web.enable-lifecycle"
+    ports:
+      - "9090:9090"
+    networks:
+      - internal
+      - dmz
+
+  grafana:
+    image: grafana/grafana:11.2.0
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/stablecoin.json
+    volumes:
+      - ./monitoring/grafana-dashboard.json:/var/lib/grafana/dashboards/stablecoin.json:ro
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+    networks:
+      - dmz
+
+  # ── API Gateway — only internet-facing service ─────────────────────────────
+
+  api-gateway:
+    build:
+      context: .
+      dockerfile: services/api-gateway/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      token-issuance:
+        condition: service_healthy
+      rtgs:
+        condition: service_healthy
+      payment-engine:
+        condition: service_healthy
+      fx-settlement:
+        condition: service_healthy
+    environment:
+      SERVICE_NAME: api-gateway
+      TOKEN_ISSUANCE_URL: http://token-issuance:8001
+      RTGS_URL: http://rtgs:8002
+      PAYMENT_ENGINE_URL: http://payment-engine:8003
+      FX_SETTLEMENT_URL: http://fx-settlement:8004
+      COMPLIANCE_URL: http://compliance-monitor:8005
+      GATEWAY_API_KEY: ${GATEWAY_API_KEY:-change-me-in-production}
+      PORT: 8000
+    ports:
+      - "8000:8000"        # Only exposed port — DMZ boundary
+    networks:
+      - dmz
+      - internal

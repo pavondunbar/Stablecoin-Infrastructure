@@ -1,0 +1,38 @@
+global:
+  scrape_interval:     15s
+  evaluation_interval: 15s
+  external_labels:
+    platform: stablecoin-infra
+    env:      docker-compose
+
+scrape_configs:
+
+  - job_name: api-gateway
+    static_configs:
+      - targets: ['api-gateway:8000']
+    metrics_path: /metrics
+
+  - job_name: token-issuance
+    static_configs:
+      - targets: ['token-issuance:8001']
+    metrics_path: /metrics
+
+  - job_name: rtgs
+    static_configs:
+      - targets: ['rtgs:8002']
+    metrics_path: /metrics
+
+  - job_name: payment-engine
+    static_configs:
+      - targets: ['payment-engine:8003']
+    metrics_path: /metrics
+
+  - job_name: fx-settlement
+    static_configs:
+      - targets: ['fx-settlement:8004']
+    metrics_path: /metrics
+
+  - job_name: compliance-monitor
+    static_configs:
+      - targets: ['compliance-monitor:8005']
+    metrics_path: /metrics
