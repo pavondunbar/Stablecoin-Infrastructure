@@ -2,6 +2,9 @@
 
 <img width="1536" height="1024" alt="4a5ef1cf-30c8-4905-bd6a-1898bb03a573" src="https://github.com/user-attachments/assets/277554ed-4623-4159-b6f3-daa0abfaf115" />
 
+> ⚠️ **SANDBOX / EDUCATIONAL USE ONLY — NOT FOR PRODUCTION**
+> This codebase is a reference implementation designed for learning, prototyping, and architectural exploration. It is **not audited, not legally reviewed, and must not be used to issue real tokenized deposits, manage real funds, or interface with real payment rails (SWIFT, FedWire, TARGET2).** See the [Production Warning](#production-warning) section for full details.
+
 Microservices platform for tokenized deposit issuance, real-time gross settlement (RTGS), programmable payments, and cross-border FX settlement. Modeled on institutional systems like JPMorgan Kinexys (JPM Coin), PayPal PYUSD, and the Regulated Liability Network (RLN).
 
 The system implements a blockchain-grade double-entry ledger with immutability enforcement, transactional outbox event publishing, MPC-based transaction signing, role-based access control with separation of duties, and a trust-boundary network model where only the API gateway is internet-facing.
