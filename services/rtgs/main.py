@@ -61,6 +61,7 @@ from shared.models import (
     TransactionStatusHistory,
     JournalEntry,
 )
+from shared.blockchain_sim import record_on_chain
 
 log = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -152,6 +153,15 @@ def _process_one_settlement(db: Session, settlement: RTGSSettlement) -> bool:
         settlement.status = SettlementStatus.SETTLED
         settlement.settled_at = datetime.now(timezone.utc)
         settlement.transaction_id = txn.id
+
+        # Record on simulated blockchain
+        receipt = record_on_chain(
+            settlement.settlement_ref, "rtgs_settlement"
+        )
+        settlement.extra_metadata = {
+            **settlement.extra_metadata, "blockchain": receipt
+        }
+
         record_status(
             db, RTGSSettlementStatusHistory,
             "settlement_id", settlement.id,
@@ -409,6 +419,7 @@ def get_settlement(settlement_ref: str, db: Session = Depends(get_db_session)):
         "failure_reason":       s.failure_reason,
         "retry_count":          s.retry_count,
         "transaction_id":       str(s.transaction_id) if s.transaction_id else None,
+        "blockchain":           s.extra_metadata.get("blockchain"),
     }
 
 

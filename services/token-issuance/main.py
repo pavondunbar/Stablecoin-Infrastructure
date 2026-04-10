@@ -49,6 +49,7 @@ from shared.models import (
     TransactionStatusHistory,
     JournalEntry,
 )
+from shared.blockchain_sim import record_on_chain
 from events import (
     TokenIssuanceCompleted, TokenIssuanceRequested,
     TokenRedemptionCompleted, TokenRedemptionRequested,
@@ -108,6 +109,7 @@ class IssuanceResponse(BaseModel):
     amount:       Decimal
     new_balance:  Decimal
     status:       str
+    blockchain:   Optional[dict] = None
 
 
 # ─── Business Logic ─────────────────────────────────────────────────
@@ -131,7 +133,7 @@ def _issue_tokens(
             )
         ).scalar_one_or_none()
         if existing:
-            return existing
+            return existing, None
 
     # Verify account exists and is KYC/AML cleared
     account = db.get(Account, account_id)
@@ -211,13 +213,18 @@ def _issue_tokens(
     db.add(txn)
     db.flush()
 
-    # Record status history
+    # Record on simulated blockchain and status history
+    receipt = record_on_chain(
+        issuance_ref, "token_issuance", currency
+    )
     record_status(
         db,
         TransactionStatusHistory,
         "transaction_id",
         txn.id,
         "completed",
+        tx_hash=receipt["tx_hash"],
+        block_number=receipt["block_number"],
     )
 
     # Mark issuance completed (keep direct assignment for
@@ -265,7 +272,7 @@ def _issue_tokens(
         ),
     )
 
-    return issuance
+    return issuance, receipt
 
 
 def _redeem_tokens(
@@ -285,7 +292,7 @@ def _redeem_tokens(
             )
         ).scalar_one_or_none()
         if existing:
-            return existing
+            return existing, None
 
     account = db.get(Account, account_id)
     if not account or not account.is_active:
@@ -358,13 +365,18 @@ def _redeem_tokens(
     db.add(txn)
     db.flush()
 
-    # Record status history
+    # Record on simulated blockchain and status history
+    receipt = record_on_chain(
+        redemption_ref, "token_redemption", currency
+    )
     record_status(
         db,
         TransactionStatusHistory,
         "transaction_id",
         txn.id,
         "completed",
+        tx_hash=receipt["tx_hash"],
+        block_number=receipt["block_number"],
     )
 
     # Mark redemption completed
@@ -411,7 +423,7 @@ def _redeem_tokens(
         ),
     )
 
-    return issuance
+    return issuance, receipt
 
 
 # ─── FastAPI App ────────────────────────────────────────────────────
@@ -456,7 +468,7 @@ def issue_tokens(
     Atomic double-entry: omnibus reserve is debited, recipient
     is credited.
     """
-    issuance = _issue_tokens(
+    issuance, receipt = _issue_tokens(
         db,
         account_id=str(req.account_id),
         currency=req.currency.value,
@@ -477,6 +489,7 @@ def issue_tokens(
         amount=issuance.amount,
         new_balance=new_balance,
         status=issuance.status.value,
+        blockchain=receipt,
     )
 
 
@@ -494,7 +507,7 @@ def redeem_tokens(
     Atomically burns tokens and credits the omnibus reserve for
     fiat payout.
     """
-    issuance = _redeem_tokens(
+    issuance, receipt = _redeem_tokens(
         db,
         account_id=str(req.account_id),
         currency=req.currency.value,
@@ -514,6 +527,7 @@ def redeem_tokens(
         amount=issuance.amount,
         new_balance=new_balance,
         status=issuance.status.value,
+        blockchain=receipt,
     )
 
 

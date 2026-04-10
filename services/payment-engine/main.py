@@ -61,6 +61,7 @@ from shared.models import (
     ConditionalPaymentStatusHistory,
     TransactionStatusHistory, JournalEntry,
 )
+from shared.blockchain_sim import record_on_chain
 
 log = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -288,7 +289,7 @@ def _check_conditions():
                         trigger = {"kyc_cleared": payee and payee.kyc_verified and payee.aml_cleared}
 
                     if evaluate_condition(cp.condition_type.value, cp.condition_params, trigger):
-                        _execute_conditional_payment(db, cp, trigger, "auto-checker")
+                        _execute_conditional_payment(db, cp, trigger, "auto-checker")  # receipt ignored
 
                 # Check escrow expiry
                 expired_escrows = db.execute(
@@ -343,6 +344,15 @@ def _execute_conditional_payment(
     cp.status = TxnStatus.COMPLETED
     cp.executed_at = datetime.now(timezone.utc)
     cp.transaction_id = txn.id
+
+    # Record on simulated blockchain
+    receipt = record_on_chain(
+        cp.payment_ref, "conditional_payment"
+    )
+    cp.trigger_data = {
+        **(cp.trigger_data or {}), "blockchain": receipt
+    }
+
     db.flush()
     record_status(
         db, ConditionalPaymentStatusHistory,
@@ -361,7 +371,7 @@ def _execute_conditional_payment(
         ),
     )
     log.info("Conditional payment executed: %s", cp.payment_ref)
-    return txn
+    return txn, receipt
 
 
 def _expire_escrow(db: Session, escrow: EscrowContract):
@@ -556,12 +566,13 @@ def trigger_conditional_payment(
         )
         return {"result": "condition_not_satisfied", "payment_ref": payment_ref}
 
-    txn = _execute_conditional_payment(db, cp, req.trigger_data, req.triggered_by)
+    txn, receipt = _execute_conditional_payment(db, cp, req.trigger_data, req.triggered_by)
     return {
         "result":         "executed",
         "payment_ref":    payment_ref,
         "transaction_id": str(txn.id),
         "executed_at":    cp.executed_at,
+        "blockchain":     receipt,
     }
 
 
@@ -583,6 +594,7 @@ def get_conditional_payment(payment_ref: str, db: Session = Depends(get_db_sessi
         "created_at":      cp.created_at,
         "executed_at":     cp.executed_at,
         "expires_at":      cp.expires_at,
+        "blockchain":      (cp.trigger_data or {}).get("blockchain"),
     }
 
 
@@ -731,7 +743,14 @@ def release_escrow(
                 amount=escrow.amount,
             ),
         )
-        return {"result": "released_to_beneficiary", "transaction_id": str(txn.id)}
+        receipt = record_on_chain(
+            contract_ref, "escrow_release"
+        )
+        return {
+            "result": "released_to_beneficiary",
+            "transaction_id": str(txn.id),
+            "blockchain": receipt,
+        }
 
     else:  # refund to depositor — un-reserve the funds
         depositor_id = str(escrow.depositor_account_id)

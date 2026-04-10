@@ -60,6 +60,7 @@ from shared.models import (
     TransactionStatusHistory,
     JournalEntry,
 )
+from shared.blockchain_sim import record_on_chain
 
 log = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -293,8 +294,18 @@ def _process_fx_settlement(db: Session, fx: FXSettlement) -> bool:
         fx.status = SettlementStatus.SETTLED
         fx.settled_at = now
 
+        # Record on simulated blockchain
+        receipt = record_on_chain(
+            settle_ref, "fx_settlement"
+        )
+        fx.blockchain_tx_hash = receipt["tx_hash"]
+        fx.extra_metadata = {
+            **fx.extra_metadata, "blockchain": receipt
+        }
+
+        # MPC signing for blockchain rails
         if fx.rails == SettlementRails.BLOCKCHAIN:
-            fx.blockchain_tx_hash = _sign_settlement(
+            mpc_sig = _sign_settlement(
                 settle_ref,
                 {
                     "sell_currency": fx.sell_currency.value,
@@ -303,6 +314,10 @@ def _process_fx_settlement(db: Session, fx: FXSettlement) -> bool:
                     "buy_amount": str(fx.buy_amount),
                 },
             )
+            if mpc_sig:
+                fx.extra_metadata["blockchain"][
+                    "mpc_signature"
+                ] = mpc_sig
 
         record_status(
             db, FXSettlementStatusHistory,
@@ -690,6 +705,7 @@ def get_fx_settlement(settlement_ref: str, db: Session = Depends(get_db_session)
         "value_date":          str(fx.value_date),
         "created_at":          fx.created_at,
         "settled_at":          fx.settled_at,
+        "blockchain":          fx.extra_metadata.get("blockchain"),
     }
 
 

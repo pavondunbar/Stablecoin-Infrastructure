@@ -83,6 +83,17 @@ def check(resp: httpx.Response, expected: int = None) -> dict:
     return data
 
 
+def show_chain(data: dict):
+    """Display simulated blockchain recording from API response."""
+    bc = data.get("blockchain")
+    if not bc:
+        return
+    ok(
+        f"Chain: block #{bc['block_number']}  "
+        f"tx={bc['tx_hash'][:18]}...  ({bc['network']})"
+    )
+
+
 # ─── Step Runner ──────────────────────────────────────────────────────────────
 
 step_n = 0
@@ -129,6 +140,7 @@ def demo_token_issuance(bank_a_id: str, bank_b_id: str) -> dict:
     })
     data = check(r, 201)
     ok(f"Issued {data['amount']} {data['currency']} → balance: {data['new_balance']}")
+    show_chain(data)
 
     step("Issue €5M tokenized EUR to Bank A")
     r = client.post("/v1/tokens/issue", json={
@@ -138,8 +150,9 @@ def demo_token_issuance(bank_a_id: str, bank_b_id: str) -> dict:
         "backing_ref": "FIAT-DEP-2024-002",
         "custodian":   "Deutsche Bank",
     })
-    check(r, 201)
+    data = check(r, 201)
     ok("EUR issuance succeeded.")
+    show_chain(data)
 
     step("Check Bank A balances")
     r   = client.get(f"/v1/tokens/balance/{bank_a_id}")
@@ -156,6 +169,7 @@ def demo_token_issuance(bank_a_id: str, bank_b_id: str) -> dict:
     })
     data = check(r, 201)
     ok(f"Redeemed {data['amount']} USD → new balance: {data['new_balance']}")
+    show_chain(data)
 
     return {"bank_a_usd": Decimal(data["new_balance"])}
 
@@ -208,6 +222,7 @@ def demo_rtgs(bank_a_id: str, bank_b_id: str) -> dict:
         info(f"  attempt {attempt+1}: status={s['status']}")
         if s["status"] == "settled":
             ok(f"Settled in {attempt+1} polls! txn_id={s['transaction_id']}")
+            show_chain(s)
             break
     else:
         fail("Settlement did not complete in time.")
@@ -257,6 +272,7 @@ def demo_programmable_payments(bank_a_id: str, bank_b_id: str) -> dict:
     data = check(r, 200)
     if data["status"] == "completed":
         ok(f"Time-lock executed automatically! txn recorded at {data['executed_at']}")
+        show_chain(data)
     else:
         info(f"Status: {data['status']} (checker interval may not have fired yet)")
 
@@ -291,6 +307,7 @@ def demo_programmable_payments(bank_a_id: str, bank_b_id: str) -> dict:
     data = check(r, 200)
     if data.get("result") == "executed":
         ok(f"Oracle payment executed! txn_id={data['transaction_id']}")
+        show_chain(data)
     else:
         info(f"Result: {data}")
 
@@ -318,6 +335,7 @@ def demo_programmable_payments(bank_a_id: str, bank_b_id: str) -> dict:
     })
     data = check(r, 200)
     ok(f"Multi-sig result: {data.get('result')}")
+    show_chain(data)
 
     # ── Escrow ────────────────────────────────────────────────────────────────
     step("Create escrow: Bank A locks $2M for trade finance (30-day expiry)")
@@ -340,6 +358,7 @@ def demo_programmable_payments(bank_a_id: str, bank_b_id: str) -> dict:
     })
     data = check(r, 200)
     ok(f"Escrow released: {data['result']}  txn_id={data.get('transaction_id')}")
+    show_chain(data)
 
     return {}
 
@@ -388,13 +407,10 @@ def demo_fx_settlement(bank_a_id: str, bank_b_id: str) -> dict:
         s = check(r, 200)
         info(f"  attempt {attempt+1}: status={s['status']}")
         if s["status"] == "settled":
-            tx_hash = s.get("blockchain_tx_hash", "")
-            if tx_hash and tx_hash.startswith("0x"):
-                ok(f"PvP settled! MPC-signed hash={tx_hash[:18]}...")
-            else:
-                ok("PvP settled! (no blockchain hash — non-blockchain rails)")
+            ok(f"PvP settled in {attempt+1} polls!")
             ok(f"  sell_txn={s['sell_txn_id']}")
             ok(f"  buy_txn={s['buy_txn_id']}")
+            show_chain(s)
             break
     else:
         info("FX settlement still processing (worker may be busy)")
@@ -479,7 +495,7 @@ def run():
     ok("RTGS gross settlement with priority queuing")
     ok("Conditional payments: time-lock, oracle, multi-sig, delivery")
     ok("Escrow contracts with atomic lock/release/refund")
-    ok("Cross-border PvP FX settlement with MPC-signed blockchain hash")
+    ok("Cross-border PvP FX settlement with simulated blockchain recording")
     ok("All events published via transactional outbox to Kafka")
     print(f"\n  {BOLD}Explore the OpenAPI docs at: {GW}/docs{RESET}\n")
 
