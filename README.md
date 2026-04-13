@@ -112,6 +112,7 @@ Issues and redeems tokenized deposits against an omnibus reserve account. Every 
 - Supports idempotency keys to prevent duplicate processing
 - 8-decimal-place precision with banker's rounding (`ROUND_HALF_EVEN`)
 - Uses advisory database locks on omnibus account during issuance
+- Records every issuance/redemption on the simulated L2 chain (`blockchain_sim`) and generates a complementary fiat rail receipt (FedWire) — both returned in the API response as `blockchain` (token leg) and `fiat_leg`
 - Publishes `token.issuance.completed`, `token.redemption.completed`, and `token.balance.updated` events via outbox
 
 **System accounts seeded at startup:**
@@ -131,6 +132,7 @@ Real-time gross settlement with priority-based queue processing and a multi-step
 - `SELECT FOR UPDATE` with `SKIP LOCKED` for concurrent worker safety
 - Atomic balance transfers with advisory locks and row-level locking
 - Retries up to 3 times for transient failures (not insufficient balance)
+- Records every settled instruction on the simulated L2 chain and generates a complementary FedWire fiat receipt — both returned in the settlement response as `token_leg` and `fiat_leg`
 - Publishes lifecycle events via outbox: `submitted` -> `processing` -> `completed` or `failed`
 
 **Approval workflow:**
@@ -170,6 +172,7 @@ Cross-border payment-vs-payment (PvP) atomic swaps with MPC-signed blockchain tr
 - Supports 5 settlement rails: `blockchain`, `swift`, `internal`, `fedwire`, `target2`
 - Routes through nostro accounts per currency (USD/EUR/GBP)
 - Calls the signing gateway for MPC-signed transaction hashes on blockchain rails
+- Records every settlement on the simulated L2 chain (token leg) and generates a complementary fiat rail receipt — both returned in the settlement response as `token_leg` and `fiat_leg`
 - Publishes events via outbox: `initiated`, `leg.completed` (sell and buy), `completed` or `failed`
 
 **Seeded FX rates:** USD/EUR, USD/GBP, EUR/USD, EUR/GBP, GBP/USD, GBP/EUR
@@ -195,15 +198,15 @@ Risk scores range from 0 to 100 (cumulative, 25 points per flag). Results are pe
 
 ### Signing Gateway (port 8006)
 
-Coordinates MPC signing requests across three independent MPC nodes in an isolated network. Fans out the signing payload to all nodes, collects partial signatures, and combines them when the 2-of-3 threshold (`(N // 2) + 1`) is met. Returns HTTP 503 if the threshold is not met.
+Coordinates MPC signing requests across three independent MPC nodes in an isolated network. Fans out the signing payload to all nodes, collects partial signatures, and combines them when the 2-of-3 threshold (`(N // 2) + 1`) is met. Returns HTTP 503 if the threshold is not met. Implemented with `aiohttp` (not FastAPI).
 
 ### MPC Nodes (3 instances)
 
-Stateless signing nodes that produce deterministic partial signatures (`SHA256(NODE_ID + sorted JSON)`). Each node runs independently in the isolated signing network with no database access and no internet access.
+Stateless signing nodes that produce deterministic partial signatures (`SHA256(NODE_ID + sorted JSON)`). Each node runs independently in the isolated signing network with no database access and no internet access. Implemented with `aiohttp`.
 
 ### Outbox Publisher (port 8010)
 
-Polls the `outbox_events` database table every 100ms for unpublished events and forwards them to Kafka. Uses `FOR UPDATE SKIP LOCKED` for safe horizontal scaling. Publishes with `acks=all` and marks events as published within the same transaction. Processes batches of 100 events per cycle.
+Polls the `outbox_events` database table every 100ms for unpublished events and forwards them to Kafka. Uses `FOR UPDATE SKIP LOCKED` for safe horizontal scaling. Publishes with `acks=all` and marks events as published within the same transaction. Processes batches of 100 events per cycle. Implemented with `asyncpg` and `aiokafka` (fully async).
 
 ---
 
@@ -226,9 +229,11 @@ accounts                     chart_of_accounts
 
 api_keys
   +- key_hash (SHA-256, unique)
+  +- actor_id (UUID FK -> accounts)
+  +- actor_name
   +- role (admin|approver|signer|trader|auditor)
-  +- name
   +- is_active
+  +- expires_at
 ```
 
 ### Ledger Tables (Immutable)
@@ -255,9 +260,10 @@ ledger_entries (IMMUTABLE - triggers reject UPDATE/DELETE)
   +- balance_after
 
 escrow_holds (IMMUTABLE - triggers reject UPDATE/DELETE)
+  +- hold_ref (index)
   +- account_id, currency
   +- amount, hold_type (reserve|release)
-  +- reference_id
+  +- related_entity_type, related_entity_id
 ```
 
 ### Business Tables
@@ -269,7 +275,9 @@ token_balances                transactions
   +- balance NUMERIC(28,8)      +- credit_account_id FK
   +- reserved NUMERIC(28,8)     +- txn_type (6 types)
   +- version (optimistic lock)  +- idempotency_key (unique)
-  +- UNIQUE(account_id, ccy)    +- CHECK(debit != credit)
+  +- UNIQUE(account_id, ccy)    +- parent_txn_id FK (self)
+                                +- request_id, actor_id
+                                +- CHECK(debit != credit)
 
 token_issuances              rtgs_settlements
   +- issuance_ref (unique)     +- settlement_ref (unique)
@@ -293,7 +301,7 @@ fx_rates                     fx_settlements
   +- is_active                 +- rails (5 enums)
                                +- sell_txn_id / buy_txn_id FK
 compliance_events            +- blockchain_tx_hash
-  +- entity_type + entity_id
+  +- entity_type + entity_id  +- value_date
   +- result (pass|fail|review)
   +- score NUMERIC(5,2)
 ```
@@ -317,7 +325,7 @@ processed_events (Kafka consumer idempotency)
 
 ### Status History Tables (All Immutable)
 
-Six append-only status history tables track every state transition with `request_id`, `actor_id`, `actor_service`, and timestamp. Database triggers on INSERT auto-sync the current status back to the parent entity.
+Six append-only status history tables track every state transition with `request_id`, `actor_id`, `actor_service`, and timestamp. Database triggers on INSERT auto-sync the current status back to the parent entity. `transaction_status_history` additionally stores `tx_hash` and `block_number` for on-chain correlation.
 
 | History Table | Parent Entity |
 |---------------|---------------|
@@ -571,6 +579,7 @@ Edit `.env` and set real values:
 POSTGRES_PASSWORD=<strong-password>
 GATEWAY_API_KEY=$(python3 -c "import secrets; print(secrets.token_urlsafe(32))")
 GRAFANA_PASSWORD=<grafana-password>
+# Optional: set SQL_ECHO=true to enable SQLAlchemy query logging
 ```
 
 ### 2. Start the platform
@@ -644,18 +653,18 @@ Each microservice exposes a `/metrics` endpoint scraped by Prometheus every 15 s
 | `http_requests_total` | Counter | service, method, path, status_code |
 | `http_request_duration_seconds` | Histogram | service, method, path |
 | `http_requests_in_flight` | Gauge | service |
-| `tokens_issued_total` | Counter | currency, direction |
-| `token_amount_issued_total` | Counter | currency |
-| `settlements_processed_total` | Counter | status, priority |
-| `settlement_amount_total` | Counter | currency |
-| `settlement_queue_depth` | Gauge | - |
-| `conditional_payments_total` | Counter | condition_type, event |
-| `escrow_contracts_total` | Counter | event |
-| `fx_settlements_total` | Counter | rails, status |
-| `fx_volume_total` | Counter | currency |
-| `compliance_events_total` | Counter | result, event_type |
-| `kafka_publishes_total` | Counter | topic, status |
-| `kafka_publish_latency_seconds` | Histogram | topic |
+| `tokens_issued_total` | Counter | service, currency, direction |
+| `token_amount_issued_total` | Counter | service, currency |
+| `settlements_processed_total` | Counter | service, status, priority |
+| `settlement_amount_total` | Counter | service, currency |
+| `settlement_queue_depth` | Gauge | service |
+| `conditional_payments_total` | Counter | service, condition_type, event |
+| `escrow_contracts_total` | Counter | service, event |
+| `fx_settlements_total` | Counter | service, rails, status |
+| `fx_settlement_volume_total` | Counter | service, currency |
+| `compliance_events_total` | Counter | service, result, event_type |
+| `kafka_publishes_total` | Counter | service, topic, status |
+| `kafka_publish_duration_seconds` | Histogram | service, topic |
 
 ---
 
@@ -806,6 +815,15 @@ Simulated (deterministic hashes, not real cryptographic MPC) -- suitable for dem
 
 Services write events to the `outbox_events` table atomically within the same database transaction as business operations. The dedicated `outbox-publisher` service polls this table every 100ms, publishes events to Kafka with `acks=all`, and marks them as published. This guarantees at-least-once delivery without distributed transactions.
 
+### Hybrid Settlement Architecture
+
+Every settlement (token issuance, RTGS, FX) records two complementary receipts:
+
+- **Token leg** (`token_leg` / `blockchain`): the tokenized deposit movement recorded on the simulated L2 chain via `blockchain_sim.record_on_chain()`. Always present regardless of the fiat rail chosen. Returns `tx_hash`, `block_number`, `block_hash`, `gas_used`, and `network`.
+- **Fiat leg** (`fiat_leg`): the underlying cash clearing via the chosen rail (FedWire, SWIFT, TARGET2, or internal). Generated by `blockchain_sim.record_fiat_rail()`. Returns a deterministic `reference` in the format of the real rail (e.g. `FW...` for FedWire, `SWIFT-...-...` for SWIFT, `T2-...` for TARGET2). `None` for the `blockchain` rail (no separate fiat leg).
+
+Both receipts are stored in the entity's `metadata` JSONB column and returned in API responses. This mirrors the dual-rail model used by institutional tokenized deposit platforms where the token movement and the fiat settlement are complementary, not alternatives.
+
 ### Dead Letter Queue
 
 Failed Kafka messages are routed to `dlq.default` (30-day retention) after 3 retry attempts with exponential backoff. The DLQ allows manual inspection and replay of poison-pill messages.
@@ -880,7 +898,7 @@ stablecoin-infra/
 +-- .env.example
 +-- shared/
 |   +-- __init__.py
-|   +-- models.py              # SQLAlchemy ORM (21 models, 8 enums)
+|   +-- models.py              # SQLAlchemy ORM (21 models, 11 enums)
 |   +-- database.py            # Session factory, connection pooling
 |   +-- kafka_client.py        # Idempotent producer, DLQ consumer
 |   +-- events.py              # Pydantic event schemas (26 event types)
@@ -891,6 +909,7 @@ stablecoin-infra/
 |   +-- state_machine.py       # Settlement state transition validation
 |   +-- context.py             # Request context extraction (audit trail)
 |   +-- status.py              # Append-only status history recording
+|   +-- blockchain_sim.py      # Simulated L2 blockchain + fiat rail receipts
 +-- services/
 |   +-- api-gateway/           # RBAC auth, rate limiting, reverse proxy
 |   +-- token-issuance/        # Mint/burn with double-entry journal
